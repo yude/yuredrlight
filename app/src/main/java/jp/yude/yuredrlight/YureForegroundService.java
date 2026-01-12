@@ -35,7 +35,12 @@ public class YureForegroundService extends Service implements SensorEventListene
     private static final int NOTIFICATION_ID = 1001;
     private static final String CHANNEL_ID = "yure_foreground";
 
+    // 過酷環境向け: ネットワークがしばしば遮断される前提で、送信回数を抑える
     private static final int BUFFER_SIZE = 30;
+    // 通常は高頻度で送る。回線が死んでいる時だけ間引く。
+    private static final long MIN_SEND_INTERVAL_MS_WHEN_CONNECTED = 0L;
+    private static final long MIN_SEND_INTERVAL_MS_WHEN_DISCONNECTED = 500L; // 0.5秒に1回まで
+    private long lastEnqueueMs = 0L;
 
     private SensorManager sensorManager;
     private Sensor accel;
@@ -72,6 +77,12 @@ public class YureForegroundService extends Service implements SensorEventListene
     // キャリブレーション更新間隔（ms）
     private static final long CALIBRATION_INTERVAL_MS = 200;
 
+    private static final long WAKELOCK_TIMEOUT_MS = 10 * 60 * 1000L; // 10分
+    private static final long KEEPALIVE_INTERVAL_MS = 60 * 1000L; // 60秒（過酷環境向け）
+
+    private android.app.AlarmManager alarmManager;
+    private android.app.PendingIntent keepAlivePi;
+
     public static void start(Context context) {
         Intent i = new Intent(context, YureForegroundService.class);
         if (Build.VERSION.SDK_INT >= 26) {
@@ -106,6 +117,7 @@ public class YureForegroundService extends Service implements SensorEventListene
         wsClient = new YureWebSocketClient(msg -> Log.d("YureWS", msg));
 
         acquireWakeLock();
+        scheduleKeepAlive();
         startAsForeground();
         registerSensor();
         wsClient.start();
@@ -127,6 +139,7 @@ public class YureForegroundService extends Service implements SensorEventListene
         synchronized (bufferLock) {
             dataBuffer.clear();
         }
+        cancelKeepAlive();
         releaseWakeLock();
         super.onDestroy();
     }
@@ -230,7 +243,18 @@ public class YureForegroundService extends Service implements SensorEventListene
         }
 
         if (flush != null) {
-            wsClient.enqueue(YureJson.toJsonArray(flush));
+            long nowMs = SystemClock.elapsedRealtime();
+
+            // 直近で送信が成功しているなら通常モード（間引かない）
+            boolean recentlySent = wsClient != null && wsClient.wasSendOkRecently(5_000L);
+            long minInterval = recentlySent ? MIN_SEND_INTERVAL_MS_WHEN_CONNECTED : MIN_SEND_INTERVAL_MS_WHEN_DISCONNECTED;
+
+            if (minInterval == 0L || nowMs - lastEnqueueMs >= minInterval) {
+                lastEnqueueMs = nowMs;
+                wsClient.enqueue(YureJson.toJsonArray(flush));
+            } else {
+                // 間引き時: 送信キュー側に既に溜まっているはずなので捨てる（無限増大を避ける）
+            }
         }
     }
 
@@ -270,13 +294,42 @@ public class YureForegroundService extends Service implements SensorEventListene
         startForeground(NOTIFICATION_ID, n);
     }
 
+    private void scheduleKeepAlive() {
+        alarmManager = (android.app.AlarmManager) getSystemService(ALARM_SERVICE);
+        if (alarmManager == null) return;
+
+        Intent i = new Intent(this, KeepAliveReceiver.class);
+        int flags = android.app.PendingIntent.FLAG_IMMUTABLE;
+        keepAlivePi = android.app.PendingIntent.getBroadcast(this, 0, i, flags);
+
+        long first = SystemClock.elapsedRealtime() + KEEPALIVE_INTERVAL_MS;
+        // 省電力と確実性のバランスを取り、inexact repeatingを使う
+        alarmManager.setInexactRepeating(
+                android.app.AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                first,
+                KEEPALIVE_INTERVAL_MS,
+                keepAlivePi
+        );
+    }
+
+    private void cancelKeepAlive() {
+        if (alarmManager == null || keepAlivePi == null) return;
+        try {
+            alarmManager.cancel(keepAlivePi);
+        } catch (Exception ignored) {
+        }
+        keepAlivePi = null;
+        alarmManager = null;
+    }
+
     private void acquireWakeLock() {
         PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
         if (pm == null) return;
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "yuredrlight:YureWakeLock");
         wakeLock.setReferenceCounted(false);
         try {
-            wakeLock.acquire();
+            // タイムアウト付きで取得し、Alarmで定期的に再度起こす
+            wakeLock.acquire(WAKELOCK_TIMEOUT_MS);
         } catch (Exception e) {
             Log.w(TAG, "wakelock acquire failed: " + e);
         }

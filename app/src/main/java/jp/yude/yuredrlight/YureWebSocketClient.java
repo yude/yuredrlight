@@ -8,7 +8,6 @@ import java.security.cert.X509Certificate;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
-import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.TrustManager;
@@ -48,6 +47,13 @@ public class YureWebSocketClient {
 
     private Thread worker;
     private final Logger logger;
+
+    private volatile long lastSendOkElapsedMs = 0L;
+    private static final long SEND_STALL_TIMEOUT_MS = 2 * 60 * 1000L; // 2分送れてなければ切り直す
+
+    private long backoffMs = 1000;
+    private static final long BACKOFF_MAX_MS = 60_000L;
+    private static final long DNS_BACKOFF_MIN_MS = 5_000L;
 
     public YureWebSocketClient(Logger logger) {
         this.logger = logger;
@@ -110,11 +116,22 @@ public class YureWebSocketClient {
 
     private void runLoop() {
         log("ws runLoop entered");
-        long backoffMs = 1000;
+
+        // 初期化
+        lastSendOkElapsedMs = android.os.SystemClock.elapsedRealtime();
+        backoffMs = 1000;
 
         while (!closed && !Thread.currentThread().isInterrupted()) {
             try {
                 ensureConnected();
+
+                long now = android.os.SystemClock.elapsedRealtime();
+                if (now - lastSendOkElapsedMs > SEND_STALL_TIMEOUT_MS) {
+                    log("ws watchdog: send stalled, reconnecting");
+                    disconnectQuietly();
+                    // 次の接続は少し待つ
+                    sleepQuietly(backoffMs);
+                }
 
                 String msg = sendQueue.poll(1, TimeUnit.SECONDS);
                 if (msg == null) continue;
@@ -123,24 +140,28 @@ public class YureWebSocketClient {
                 if (current != null) {
                     boolean ok = current.send(msg);
                     log("ws send ok=" + ok + " bytes=" + msg.length());
-                    if (!ok) {
-                        // 送れなければ戻して再接続
+                    if (ok) {
+                        lastSendOkElapsedMs = android.os.SystemClock.elapsedRealtime();
+                        backoffMs = 1000; // 成功したらリセット
+                    } else {
                         sendQueue.offer(msg);
                         disconnectQuietly();
+                        sleepQuietly(backoffMs);
+                        backoffMs = Math.min(backoffMs * 2, BACKOFF_MAX_MS);
                     }
                 } else {
+                    // 未接続なら戻して待つ
                     sendQueue.offer(msg);
-                    sleepQuietly(200);
+                    sleepQuietly(backoffMs);
+                    backoffMs = Math.min(backoffMs * 2, BACKOFF_MAX_MS);
                 }
-
-                backoffMs = 1000;
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             } catch (Exception e) {
                 log("ws loop error: " + e);
                 disconnectQuietly();
                 sleepQuietly(backoffMs);
-                backoffMs = Math.min(backoffMs * 2, 10000);
+                backoffMs = Math.min(backoffMs * 2, BACKOFF_MAX_MS);
             }
         }
 
@@ -165,13 +186,15 @@ public class YureWebSocketClient {
         Request request = new Request.Builder().url(URL).build();
         log("ws connecting to " + URL);
 
-        WebSocket newWs = c.newWebSocket(request, new WebSocketListener() {
+        c.newWebSocket(request, new WebSocketListener() {
             @Override
             public void onOpen(WebSocket webSocket, Response response) {
                 log("ws connected");
                 synchronized (lock) {
                     ws = webSocket;
                 }
+                backoffMs = 1000;
+                lastSendOkElapsedMs = android.os.SystemClock.elapsedRealtime();
             }
 
             @Override
@@ -198,17 +221,29 @@ public class YureWebSocketClient {
                 synchronized (lock) {
                     if (ws == webSocket) ws = null;
                 }
+
+                // DNS/回線が死んでいる間は無駄な接続連打を避ける
+                if (t instanceof java.net.UnknownHostException) {
+                    backoffMs = Math.max(backoffMs, DNS_BACKOFF_MIN_MS);
+                    backoffMs = Math.min(backoffMs * 2, BACKOFF_MAX_MS);
+                } else if (t instanceof javax.net.ssl.SSLException || t instanceof java.net.SocketTimeoutException) {
+                    backoffMs = Math.max(backoffMs, 2000);
+                    backoffMs = Math.min(backoffMs * 2, BACKOFF_MAX_MS);
+                }
             }
         });
-
-        // onOpenで ws をセットするのでここでは触らない
-        if (newWs == null) {
-            log("ws newWebSocket returned null");
-        }
     }
 
     private OkHttpClient buildClient() {
         OkHttpClient.Builder b = new OkHttpClient.Builder();
+
+        // 過酷環境向け: 低速/不安定回線で固まらないようにタイムアウトを設定
+        b.connectTimeout(10, TimeUnit.SECONDS);
+        b.readTimeout(0, TimeUnit.SECONDS); // WebSocketなので無制限
+        b.writeTimeout(10, TimeUnit.SECONDS);
+
+        // 過酷環境向け: NAT/省電力でアイドル切断されないように定期ping
+        b.pingInterval(20, TimeUnit.SECONDS);
 
         if (INSECURE_SKIP_TLS_VERIFICATION) {
             SSLSocketFactory sslSocketFactory = buildInsecureSocketFactory();
@@ -273,5 +308,13 @@ public class YureWebSocketClient {
     private void log(String msg) {
         if (logger == null) return;
         mainHandler.post(() -> logger.log(msg));
+    }
+
+    /**
+     * 直近で送信成功しているか（サービス側の送信間引き判定用）
+     */
+    public boolean wasSendOkRecently(long withinMs) {
+        long now = android.os.SystemClock.elapsedRealtime();
+        return now - lastSendOkElapsedMs <= withinMs;
     }
 }
